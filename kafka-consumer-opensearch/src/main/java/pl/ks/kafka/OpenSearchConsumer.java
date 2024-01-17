@@ -4,8 +4,10 @@ import com.google.gson.JsonParser;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.common.errors.WakeupException;
+import org.opensearch.action.bulk.BulkRequest;
+import org.opensearch.action.bulk.BulkResponse;
 import org.opensearch.action.index.IndexRequest;
-import org.opensearch.action.index.IndexResponse;
 import org.opensearch.client.RequestOptions;
 import org.opensearch.client.RestHighLevelClient;
 import org.opensearch.client.indices.CreateIndexRequest;
@@ -26,9 +28,24 @@ public class OpenSearchConsumer {
 
         Logger log = LoggerFactory.getLogger(OpenSearchConsumer.class.getSimpleName());
 
-        // first create an OpenSearch Client
         RestHighLevelClient openSearchClient = OpenSearchClientFactory.createOpenSearchClient();
         KafkaConsumer<String, String> consumer = KafkaConsumerFactory.createKafkaConsumer();
+
+        final Thread mainThread = Thread.currentThread();
+        Runtime.getRuntime().addShutdownHook(new Thread() {
+            public void run() {
+                log.info("Detected a shutdown, let's exit by calling consumer.wakeup()...");
+                consumer.wakeup();
+
+                // join the main thread to allow the execution of the code in the main thread
+                try {
+                    mainThread.join();
+                } catch (InterruptedException e) {
+                    e.printStackTrace();
+                }
+            }
+        });
+
 
         try (openSearchClient; consumer) {
 
@@ -53,8 +70,9 @@ public class OpenSearchConsumer {
                 int recordCount = records.count();
                 log.info("Received " + recordCount + " record(s)");
 
-                for (ConsumerRecord<String, String> record : records) {
+                BulkRequest bulkRequest = new BulkRequest();
 
+                for (ConsumerRecord<String, String> record : records) {
 
                     // strategy 1
                     // define an ID using Kafka Record coordinates
@@ -71,17 +89,43 @@ public class OpenSearchConsumer {
                         // by adding id we guarantee idempotence, because we will process (which in this case is saving to index)
                         // messages only once, when there will be doc with the same id, then doc will be updated, not created a new one
 
-                        IndexResponse response = openSearchClient.index(indexRequest, RequestOptions.DEFAULT);
+                        //  IndexResponse response = openSearchClient.index(indexRequest, RequestOptions.DEFAULT);
+                        //  log.info(response.getId());
 
-                        log.info(response.getId());
+                        bulkRequest.add(indexRequest);
+
                     } catch (Exception e) {
                         log.error(e.getMessage());
                     }
                 }
 
+                if (bulkRequest.numberOfActions() > 0){
+                    BulkResponse bulkResponse = openSearchClient.bulk(bulkRequest, RequestOptions.DEFAULT);
+                    log.info("Inserted " + bulkResponse.getItems().length + " record(s).");
+
+                    try {
+                        Thread.sleep(1000);
+                    } catch (InterruptedException e) {
+                        e.printStackTrace();
+                    }
+
+                    // commit offsets after the batch is consumed
+                    consumer.commitSync();
+                    log.info("Offsets have been committed!");
+                }
+
             }
 
+        } catch (WakeupException e) {
+            log.info("Consumer is starting to shut down");
+        } catch (Exception e) {
+            log.error("Unexpected exception in the consumer", e);
+        } finally {
+            consumer.close(); // close the consumer, this will also commit offsets
+            openSearchClient.close();
+            log.info("The consumer is now gracefully shut down");
         }
+
     }
 
     private static String extractId(String json){
